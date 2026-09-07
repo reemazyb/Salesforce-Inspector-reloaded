@@ -87,7 +87,8 @@
         "options.html",
         "event-monitor.html",
         "flow-scanner.html",
-        "debug-log.html"
+        "debug-log.html",
+        "permission-matrix.html"
       ],
       "matches": [
         "https://*.salesforce.com/*",
@@ -175,6 +176,9 @@
     },
     "api-statistics": {
       "description": "API Statistics"
+    },
+    "permission-matrix": {
+      "description": "Permission Matrix"
     }
   }
 }

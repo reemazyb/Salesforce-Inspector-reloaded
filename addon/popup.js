@@ -132,6 +132,7 @@ class App extends React.PureComponent {
       importHref: "data-import.html?" + hostArg,
       eventMonitorHref: "event-monitor.html?" + hostArg,
       fieldCreatorHref: "field-creator.html?" + hostArg,
+      permissionMatrixHref: "permission-matrix.html?" + hostArg,
       limitsHref: "limits.html?" + hostArg,
       apiStatisticsHref: "api-statistics.html?" + hostArg,
       latestNotesViewed:
@@ -394,6 +395,7 @@ class App extends React.PureComponent {
       importHref,
       eventMonitorHref,
       fieldCreatorHref,
+      permissionMatrixHref,
       limitsHref,
       apiStatisticsHref,
       isFieldsPresent,
@@ -582,6 +584,11 @@ class App extends React.PureComponent {
             h("div", {className: "slds-col slds-size_1-of-1 slds-p-horizontal_xx-small  slds-m-bottom_xx-small"},
               h("a", {ref: "dependenciesExplorerBtn", href: `dependencies-explorer.html?${hostArg}`, target: linkTarget, className: "page-button slds-button slds-button_neutral"},
                 h("span", {}, "Dependen", h("u", {}, "c"), "ies Explorer")
+              )
+            ),
+            h("div", {className: "slds-col slds-size_1-of-1 slds-p-horizontal_xx-small  slds-m-bottom_xx-small"},
+              h("a", {ref: "permissionMatrixBtn", href: permissionMatrixHref, target: linkTarget, className: "page-button slds-button slds-button_neutral"},
+                h("span", {}, "Permission Matrix")
               )
             )
           ),
