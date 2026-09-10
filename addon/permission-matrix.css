@@ -1,5 +1,5 @@
 .pm-table-wrap {
-  max-height: min(50vh, 32rem);
+  max-height: min(62vh, 40rem);
   overflow: auto;
   border: 1px solid var(--slds-g-color-border-base-1, #e5e5e5);
   border-radius: 0.25rem;
@@ -12,12 +12,20 @@
   background: var(--slds-g-color-neutral-base-95, #f3f3f3);
 }
 
+.pm-table-wrap table thead tr.pm-subhead th {
+  top: 2.25rem;
+}
+
 .pm-table-wrap table tbody th {
   position: sticky;
   left: 0;
   z-index: 1;
   background: var(--slds-g-color-neutral-base-100, #fff);
   white-space: nowrap;
+}
+
+.pm-sticky-corner {
+  z-index: 3;
 }
 
 .pm-cell-true {
@@ -32,14 +40,6 @@
 .pm-cell-always {
   color: var(--slds-g-color-brand-base-50, #0176d3);
   font-weight: 600;
-}
-
-.pm-picker-list {
-  max-height: 12rem;
-  overflow: auto;
-  border: 1px solid var(--slds-g-color-border-base-1, #e5e5e5);
-  border-radius: 0.25rem;
-  padding: 0.25rem 0.5rem;
 }
 
 .pm-dropdown {
@@ -79,5 +79,40 @@
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.pm-filter {
+  max-width: 18rem;
+}
+
+.pm-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.75rem;
+  margin: 0 1rem 1rem;
+}
+
+.pm-summary-card {
+  background: var(--slds-g-color-neutral-base-100, #fff);
+  border: 1px solid var(--slds-g-color-border-base-1, #e5e5e5);
+  border-radius: 0.25rem;
+  padding: 0.75rem 1rem;
+}
+
+.pm-summary-card_warn {
+  border-color: var(--slds-g-color-warning-base-50, #fe9339);
+}
+
+.pm-summary-label {
+  color: var(--slds-g-color-neutral-base-30, #706e6b);
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.pm-summary-value {
+  font-size: 1.25rem;
+  font-weight: 700;
   margin-top: 0.25rem;
 }

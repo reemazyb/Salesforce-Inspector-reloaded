@@ -588,7 +588,7 @@ class App extends React.PureComponent {
             ),
             h("div", {className: "slds-col slds-size_1-of-1 slds-p-horizontal_xx-small  slds-m-bottom_xx-small"},
               h("a", {ref: "permissionMatrixBtn", href: permissionMatrixHref, target: linkTarget, className: "page-button slds-button slds-button_neutral"},
-                h("span", {}, "Permission Matrix")
+                h("span", {}, "Permissions")
               )
             )
           ),

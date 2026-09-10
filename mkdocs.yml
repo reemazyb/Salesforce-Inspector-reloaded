@@ -85,6 +85,7 @@ nav:
           - Dependencies Explorer: dependencies-explorer.md
           - Download Metadata: download-metadata.md
           - Field Creator: field-creator.md
+          - Permissions: permission-matrix.md
           - Flow Scanner: flow-scanner.md
       - API:
           - Event Monitor: event-monitor.md

@@ -9,6 +9,9 @@ export const OLS_KEYS = [
   {key: "modifyAll", label: "Modify All", field: "PermissionsModifyAllRecords"}
 ];
 
+const GET = {method: "GET"};
+const FIELD_CHUNK = 40;
+
 export function escapeSoql(value) {
   return String(value == null ? "" : value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
@@ -26,10 +29,10 @@ export function chunk(items, size) {
 }
 
 export async function queryAll(soql) {
-  let result = await sfConn.rest("/services/data/v" + apiVersion + "/query/?q=" + encodeURIComponent(soql));
+  let result = await sfConn.rest("/services/data/v" + apiVersion + "/query/?q=" + encodeURIComponent(soql), GET);
   const records = result.records ? result.records.slice() : [];
   while (!result.done && result.nextRecordsUrl) {
-    result = await sfConn.rest(result.nextRecordsUrl);
+    result = await sfConn.rest(result.nextRecordsUrl, GET);
     if (result.records) {
       records.push(...result.records);
     }
@@ -107,7 +110,7 @@ export async function searchUsers(term) {
   const soql = "SELECT Id, Name, Username, Email, IsActive, Alias, ProfileId, Profile.Name"
     + " FROM User WHERE (Name LIKE '%" + escaped + "%' OR Username LIKE '%" + escaped + "%'"
     + " OR Email LIKE '%" + escaped + "%' OR Alias LIKE '%" + escaped + "%')"
-    + " ORDER BY IsActive DESC, LastLoginDate LIMIT 20";
+    + " ORDER BY IsActive DESC, Name LIMIT 20";
   return queryAll(soql);
 }
 
@@ -132,7 +135,7 @@ export async function searchPermissionSets(term) {
   }
   const records = await queryAll(
     "SELECT Id, Name, Label, Type, IsOwnedByProfile, ProfileId, Profile.Name FROM PermissionSet"
-    + " WHERE IsOwnedByProfile = false AND (Label LIKE '%" + escaped + "%' OR Name LIKE '%" + escaped + "%')"
+    + " WHERE IsOwnedByProfile = false AND Type != 'Group' AND (Label LIKE '%" + escaped + "%' OR Name LIKE '%" + escaped + "%')"
     + " ORDER BY Label LIMIT 50"
   );
   return sortParents(records.map(record => toParent(record)));
@@ -156,59 +159,75 @@ export async function getUserAssignments(userId) {
   let records;
   try {
     records = await queryAll(fields + ", PermissionSetGroup.MasterLabel, PermissionSetGroup.DeveloperName FROM PermissionSetAssignment" + idClause);
-  } catch {
+  } catch (err) {
+    const msg = String((err && err.message) || err);
+    if (!/INVALID_FIELD|PermissionSetGroup/i.test(msg)) {
+      throw err;
+    }
     records = await queryAll(fields + " FROM PermissionSetAssignment" + idClause);
   }
   const parents = [];
+  const seen = new Set();
   for (const record of records) {
-    if (record.PermissionSet && record.PermissionSet.Id) {
+    if (record.PermissionSet && record.PermissionSet.Id && !seen.has(record.PermissionSet.Id)) {
+      seen.add(record.PermissionSet.Id);
       parents.push(toParent(record.PermissionSet, record));
     }
   }
   return sortParents(parents);
 }
 
-async function queryByParents(selectAndFrom, parentIds, sobject) {
+async function queryByParents(selectAndFrom, parentIds, extraWhere) {
   if (!parentIds.length) {
     return [];
   }
-  const groups = await Promise.all(chunk(parentIds, 100).map(group => {
-    let soql = selectAndFrom + " WHERE ParentId IN (" + group.map(soqlQuote).join(",") + ")";
-    if (sobject) {
-      soql += " AND SobjectType = " + soqlQuote(sobject);
-    }
-    return queryAll(soql);
-  }));
+  const groups = await Promise.all(chunk(parentIds, 100).map(group => queryAll(
+    selectAndFrom + " WHERE ParentId IN (" + group.map(soqlQuote).join(",") + ")" + (extraWhere || "")
+  )));
   return groups.flat();
 }
 
 export async function getObjectPermissions(parentIds, sobject) {
   const fields = OLS_KEYS.map(item => item.field).join(", ");
-  return queryByParents(
-    "SELECT ParentId, SobjectType, " + fields + " FROM ObjectPermissions",
-    parentIds,
-    sobject
-  );
+  const extra = sobject ? " AND SobjectType = " + soqlQuote(sobject) : "";
+  return queryByParents("SELECT ParentId, SobjectType, " + fields + " FROM ObjectPermissions", parentIds, extra);
 }
 
 export async function getFieldPermissions(parentIds, sobject) {
   return queryByParents(
     "SELECT ParentId, SobjectType, Field, PermissionsRead, PermissionsEdit FROM FieldPermissions",
     parentIds,
-    sobject
+    " AND SobjectType = " + soqlQuote(sobject)
   );
 }
 
 export async function getProfileObjectPermissions(parentId) {
+  return getObjectPermissions([parentId]);
+}
+
+export async function getObjectPermissionsForSobject(sobject) {
   const fields = OLS_KEYS.map(item => item.field).join(", ");
   return queryAll(
-    "SELECT ParentId, SobjectType, " + fields + " FROM ObjectPermissions WHERE ParentId = " + soqlQuote(parentId)
-    + " ORDER BY SobjectType"
+    "SELECT ParentId, SobjectType, " + fields + " FROM ObjectPermissions WHERE SobjectType = " + soqlQuote(sobject)
   );
 }
 
+export async function getParentsForSobject(sobject) {
+  const rows = await getObjectPermissionsForSobject(sobject);
+  const ids = [];
+  const seen = new Set();
+  for (const row of rows) {
+    if (row.ParentId && !seen.has(row.ParentId)) {
+      seen.add(row.ParentId);
+      ids.push(row.ParentId);
+    }
+  }
+  const parents = await getPermissionSetsByIds(ids);
+  return {parents, objectPerms: rows};
+}
+
 export async function describeFields(sobject) {
-  const describe = await sfConn.rest("/services/data/v" + apiVersion + "/sobjects/" + encodeURIComponent(sobject) + "/describe");
+  const describe = await sfConn.rest("/services/data/v" + apiVersion + "/sobjects/" + encodeURIComponent(sobject) + "/describe", GET);
   const fields = (describe.fields || []).map(field => ({
     name: field.name,
     label: field.label,
@@ -220,6 +239,59 @@ export async function describeFields(sobject) {
   }));
   fields.sort((a, b) => a.name.localeCompare(b.name));
   return fields;
+}
+
+export async function getSystemPermissionFields() {
+  const describe = await sfConn.rest("/services/data/v" + apiVersion + "/sobjects/PermissionSet/describe", GET);
+  return (describe.fields || [])
+    .filter(field => field.type === "boolean" && field.name.indexOf("Permissions") === 0)
+    .map(field => ({
+      name: field.name,
+      label: field.label || field.name.replace(/^Permissions/, "")
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export async function getPermissionSetFlags(parentIds, fieldNames) {
+  if (!parentIds.length || !fieldNames.length) {
+    return [];
+  }
+  const recordsById = {};
+  for (const fieldGroup of chunk(fieldNames, FIELD_CHUNK)) {
+    const groups = await Promise.all(chunk(parentIds, 100).map(idGroup => queryAll(
+      "SELECT Id, " + fieldGroup.join(", ") + " FROM PermissionSet WHERE Id IN (" + idGroup.map(soqlQuote).join(",") + ")"
+    )));
+    for (const record of groups.flat()) {
+      recordsById[record.Id] = Object.assign(recordsById[record.Id] || {Id: record.Id}, record);
+    }
+  }
+  return Object.keys(recordsById).map(id => recordsById[id]);
+}
+
+export async function getCustomPermissionAccess(parentIds) {
+  if (!parentIds.length) {
+    return {accessRows: [], customPerms: []};
+  }
+  const accessRows = await queryByParents(
+    "SELECT ParentId, SetupEntityId FROM SetupEntityAccess",
+    parentIds,
+    " AND SetupEntityType = 'CustomPermission'"
+  );
+  const ids = [];
+  const seen = new Set();
+  for (const row of accessRows) {
+    if (row.SetupEntityId && !seen.has(row.SetupEntityId)) {
+      seen.add(row.SetupEntityId);
+      ids.push(row.SetupEntityId);
+    }
+  }
+  if (!ids.length) {
+    return {accessRows, customPerms: []};
+  }
+  const groups = await Promise.all(chunk(ids, 100).map(group => queryAll(
+    "SELECT Id, DeveloperName, MasterLabel, NamespacePrefix FROM CustomPermission WHERE Id IN (" + group.map(soqlQuote).join(",") + ")"
+  )));
+  return {accessRows, customPerms: groups.flat()};
 }
 
 function fieldApiName(fieldValue, sobject) {
@@ -239,30 +311,74 @@ function orOls(target, source) {
   }
 }
 
-export function buildMatrix({fields, parents, objectPerms, fieldPerms, sobject}) {
-  const olsByParent = {};
-  const olsSources = {};
-  for (const item of OLS_KEYS) {
-    olsSources[item.key] = [];
-  }
-  for (const parent of parents) {
-    olsByParent[parent.id] = emptyOls();
-  }
-  for (const record of objectPerms || []) {
-    const ols = recordToOls(record);
-    olsByParent[record.ParentId] = ols;
+function objectHasAnyGrant(ols) {
+  return OLS_KEYS.some(item => ols[item.key]);
+}
+
+export function buildObjectRows({parents, objectPerms, sobjectLabels}) {
+  const labels = sobjectLabels || {};
+  const bySobject = new Map();
+
+  function ensureRow(sobject) {
+    if (bySobject.has(sobject)) {
+      return bySobject.get(sobject);
+    }
+    const sources = {};
+    const byParent = {};
+    for (const item of OLS_KEYS) {
+      sources[item.key] = [];
+    }
+    for (const parent of parents) {
+      byParent[parent.id] = emptyOls();
+    }
+    const row = {
+      sobject,
+      label: labels[sobject] || sobject,
+      byParent,
+      effective: emptyOls(),
+      sources
+    };
+    bySobject.set(sobject, row);
+    return row;
   }
 
-  const effectiveOls = emptyOls();
-  for (const parent of parents) {
-    const ols = olsByParent[parent.id] || emptyOls();
-    orOls(effectiveOls, ols);
+  for (const record of objectPerms || []) {
+    const row = ensureRow(record.SobjectType);
+    row.byParent[record.ParentId] = recordToOls(record);
+  }
+
+  for (const row of bySobject.values()) {
+    row.effective = emptyOls();
     for (const item of OLS_KEYS) {
-      if (ols[item.key]) {
-        olsSources[item.key].push(parent.label);
+      row.sources[item.key] = [];
+    }
+    for (const parent of parents) {
+      const ols = row.byParent[parent.id] || emptyOls();
+      orOls(row.effective, ols);
+      for (const item of OLS_KEYS) {
+        if (ols[item.key]) {
+          row.sources[item.key].push(parent.label);
+        }
       }
     }
   }
+
+  return Array.from(bySobject.values()).sort((a, b) => a.sobject.localeCompare(b.sobject));
+}
+
+export function buildMatrix({fields, parents, objectPerms, fieldPerms, sobject, sobjectLabels}) {
+  const objectRows = buildObjectRows({
+    parents,
+    objectPerms,
+    sobjectLabels: sobjectLabels || (sobject ? {[sobject]: sobject} : {})
+  });
+  const single = objectRows.find(row => row.sobject === sobject) || {
+    sobject,
+    label: sobject,
+    byParent: Object.fromEntries(parents.map(parent => [parent.id, emptyOls()])),
+    effective: emptyOls(),
+    sources: Object.fromEntries(OLS_KEYS.map(item => [item.key, []]))
+  };
 
   const flsByParent = {};
   for (const parent of parents) {
@@ -323,11 +439,76 @@ export function buildMatrix({fields, parents, objectPerms, fieldPerms, sobject})
 
   return {
     ols: {
-      byParent: olsByParent,
-      effective: effectiveOls,
-      sources: olsSources
+      byParent: single.byParent,
+      effective: single.effective,
+      sources: single.sources
     },
-    fls
+    fls,
+    objectRows
+  };
+}
+
+export function buildUserPerms({parents, fields, records}) {
+  const byId = {};
+  for (const record of records || []) {
+    byId[record.Id] = record;
+  }
+  return (fields || []).map(field => {
+    const sources = [];
+    let granted = false;
+    for (const parent of parents) {
+      const record = byId[parent.id];
+      if (record && record[field.name]) {
+        granted = true;
+        sources.push(parent.label);
+      }
+    }
+    return {key: field.name, label: field.label, granted, sources};
+  });
+}
+
+export function buildCustomPerms({parents, accessRows, customPerms}) {
+  const byId = {};
+  for (const perm of customPerms || []) {
+    byId[perm.Id] = perm;
+  }
+  const sourcesByPerm = {};
+  for (const row of accessRows || []) {
+    if (!sourcesByPerm[row.SetupEntityId]) {
+      sourcesByPerm[row.SetupEntityId] = [];
+    }
+    const parent = parents.find(item => item.id === row.ParentId);
+    if (parent) {
+      sourcesByPerm[row.SetupEntityId].push(parent.label);
+    }
+  }
+  return Object.keys(sourcesByPerm).map(id => {
+    const perm = byId[id];
+    const name = perm ? ((perm.NamespacePrefix ? perm.NamespacePrefix + "__" : "") + perm.DeveloperName) : id;
+    return {
+      key: id,
+      name,
+      label: perm ? (perm.MasterLabel || perm.DeveloperName) : id,
+      granted: true,
+      sources: sourcesByPerm[id]
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function summarizeSnapshot(snapshot) {
+  const objectRows = snapshot.objectRows || [];
+  const userPerms = snapshot.userPerms || [];
+  const customPerms = snapshot.customPerms || [];
+  const viewAllData = userPerms.find(item => item.key === "PermissionsViewAllData");
+  const modifyAllData = userPerms.find(item => item.key === "PermissionsModifyAllData");
+  return {
+    assignmentCount: (snapshot.parents || []).length,
+    objectCount: objectRows.filter(row => objectHasAnyGrant(row.effective)).length,
+    createCount: objectRows.filter(row => row.effective.create).length,
+    userPermCount: userPerms.filter(item => item.granted).length,
+    customPermCount: customPerms.length,
+    viewAllData: !!(viewAllData && viewAllData.granted),
+    modifyAllData: !!(modifyAllData && modifyAllData.granted)
   };
 }
 
@@ -346,16 +527,38 @@ function accessLabel(granted, always) {
   return granted ? "true" : "false";
 }
 
-export function matrixToCsv({mode, objectName, parents, matrix, profileOlsRows}) {
+export function matrixToCsv({mode, objectName, parents, matrix, objectRows, userPerms, customPerms, profileOlsRows}) {
   const lines = [];
   const parentList = parents || [];
+  const olsRows = objectRows && objectRows.length
+    ? objectRows
+    : (profileOlsRows || []).map(record => ({
+      sobject: record.SobjectType,
+      label: record.SobjectType,
+      byParent: {[parentList[0] && parentList[0].id]: recordToOls(record)},
+      effective: recordToOls(record),
+      sources: {}
+    }));
 
-  if (profileOlsRows && profileOlsRows.length && mode === "profile") {
-    lines.push(csvRow(["Object Level Security"]));
-    lines.push(csvRow(["SObject", ...OLS_KEYS.map(item => item.label)]));
-    for (const record of profileOlsRows) {
-      const ols = recordToOls(record);
-      lines.push(csvRow([record.SobjectType, ...OLS_KEYS.map(item => ols[item.key] ? "true" : "false")]));
+  if (olsRows.length) {
+    lines.push(csvRow(["Object Level Security" + (objectName ? " (" + objectName + ")" : "")]));
+    if (mode === "object") {
+      lines.push(csvRow(["Parent", "Kind", ...OLS_KEYS.map(item => item.label)]));
+      const row = olsRows[0];
+      for (const parent of parentList) {
+        const ols = (row && row.byParent[parent.id]) || emptyOls();
+        lines.push(csvRow([parent.label, parentKindLabel(parent.kind), ...OLS_KEYS.map(item => ols[item.key] ? "true" : "false")]));
+      }
+    } else {
+      lines.push(csvRow(["Object", "Label", ...OLS_KEYS.map(item => item.label), ...OLS_KEYS.map(item => item.label + " Source")]));
+      for (const row of olsRows) {
+        lines.push(csvRow([
+          row.sobject,
+          row.label,
+          ...OLS_KEYS.map(item => row.effective[item.key] ? "true" : "false"),
+          ...OLS_KEYS.map(item => (row.sources[item.key] || []).join("; "))
+        ]));
+      }
     }
     lines.push("");
   } else if (matrix) {
@@ -415,6 +618,24 @@ export function matrixToCsv({mode, objectName, parents, matrix, profileOlsRows})
           (field.sources.edit || []).join("; ")
         ]));
       }
+    }
+    lines.push("");
+  }
+
+  if (userPerms && userPerms.length) {
+    lines.push(csvRow(["User Permissions"]));
+    lines.push(csvRow(["Permission", "API Name", "Granted", "Source"]));
+    for (const perm of userPerms) {
+      lines.push(csvRow([perm.label, perm.key, perm.granted ? "true" : "false", (perm.sources || []).join("; ")]));
+    }
+    lines.push("");
+  }
+
+  if (customPerms && customPerms.length) {
+    lines.push(csvRow(["Custom Permissions"]));
+    lines.push(csvRow(["Label", "API Name", "Source"]));
+    for (const perm of customPerms) {
+      lines.push(csvRow([perm.label, perm.name, (perm.sources || []).join("; ")]));
     }
   }
 

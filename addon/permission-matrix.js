@@ -13,9 +13,16 @@ import {
   getUserAssignments,
   getObjectPermissions,
   getFieldPermissions,
-  getProfileObjectPermissions,
   describeFields,
+  getParentsForSobject,
+  getSystemPermissionFields,
+  getPermissionSetFlags,
+  getCustomPermissionAccess,
   buildMatrix,
+  buildObjectRows,
+  buildUserPerms,
+  buildCustomPerms,
+  summarizeSnapshot,
   matrixToCsv,
   parentKindLabel
 } from "./permission-matrix-data.js";
@@ -28,6 +35,13 @@ const MODES = [
   {key: "profile", label: "Profile"}
 ];
 
+const SECTIONS = [
+  {key: "objects", label: "Objects"},
+  {key: "fields", label: "Fields"},
+  {key: "userPerms", label: "User permissions"},
+  {key: "customPerms", label: "Custom permissions"}
+];
+
 class Model {
   constructor({sfHost, args}) {
     this.sfHost = sfHost;
@@ -36,10 +50,13 @@ class Model {
     this.spinnerCount = 0;
     this.reactCallback = null;
     this.errorMessage = null;
+    this.infoMessage = null;
     this.loadGen = 0;
 
     this.mode = MODES.some(item => item.key === args.get("mode")) ? args.get("mode") : "user";
+    this.section = SECTIONS.some(item => item.key === args.get("section")) ? args.get("section") : "objects";
     this.sobjects = [];
+    this.sobjectLabels = {};
     this.profiles = [];
     this.userQuery = "";
     this.userResults = [];
@@ -50,17 +67,23 @@ class Model {
     this.showObjectResults = false;
     this.selectedObject = null;
     this.selectedProfile = null;
-    this.profileQuery = "";
     this.permSetQuery = "";
     this.permSetResults = [];
+    this.showPermSetResults = false;
     this.selectedParents = [];
     this.parents = [];
     this.matrix = null;
-    this.profileOlsRows = null;
+    this.objectRows = [];
+    this.userPerms = [];
+    this.customPerms = [];
+    this.summary = null;
+    this.systemPermFields = [];
     this.fieldFilter = "";
     this.objectFilter = "";
-    this.hideNoAccess = false;
+    this.permFilter = "";
+    this.hideNoAccess = true;
     this.hideNonPermissionable = false;
+    this.hideUngrantedUserPerms = true;
 
     this.userSearchTimer = null;
     this.permSetSearchTimer = null;
@@ -68,7 +91,7 @@ class Model {
     applyProductionStyling(sfHost);
     this.spinFor = createSpinForMethod(this);
     this.userInfoModel = new UserInfoModel(this.spinFor.bind(this));
-    document.title = "Permission Matrix";
+    document.title = "Permissions";
 
     this.spinFor(this.initialize(args));
   }
@@ -80,46 +103,61 @@ class Model {
   }
 
   async initialize(args) {
-    this.sobjects = await getSobjectsList(this.sfHost);
-    this.profiles = await listProfiles();
-
-    const objectType = args.get("objectType");
-    if (objectType) {
-      this.selectedObject = this.sobjects.find(obj => obj.name === objectType) || {name: objectType, label: objectType};
-      this.objectQuery = this.selectedObject.name;
-    }
-
-    const userId = args.get("userId");
-    if (userId) {
-      const user = await getUserById(userId);
-      if (user) {
-        this.selectedUser = user;
-        this.userQuery = user.Name;
-        this.parents = await getUserAssignments(user.Id);
+    try {
+      const [sobjects, profiles, systemPermFields] = await Promise.all([
+        getSobjectsList(this.sfHost),
+        listProfiles(),
+        getSystemPermissionFields().catch(() => [])
+      ]);
+      this.sobjects = sobjects || [];
+      this.sobjectLabels = {};
+      for (const obj of this.sobjects) {
+        this.sobjectLabels[obj.name] = obj.label || obj.name;
       }
-    }
+      this.profiles = profiles;
+      this.systemPermFields = systemPermFields;
 
-    const profileId = args.get("profileId");
-    if (profileId) {
-      this.selectedProfile = this.profiles.find(profile => profile.profileId === profileId || profile.id === profileId) || null;
-      if (!this.selectedProfile) {
-        const found = await getPermissionSetsByIds([profileId]);
-        this.selectedProfile = found[0] || null;
+      const objectType = args.get("objectType");
+      if (objectType) {
+        this.selectedObject = this.sobjects.find(obj => obj.name === objectType) || {name: objectType, label: objectType};
+        this.objectQuery = this.selectedObject.name;
       }
-    }
 
-    const parentIds = (args.get("parentIds") || "").split(",").map(id => id.trim()).filter(Boolean);
-    if (parentIds.length) {
-      this.selectedParents = await getPermissionSetsByIds(parentIds);
-    }
+      const userId = args.get("userId");
+      if (userId) {
+        const user = await getUserById(userId);
+        if (user) {
+          this.selectedUser = user;
+          this.userQuery = user.Name;
+          this.parents = await getUserAssignments(user.Id);
+        }
+      }
 
-    await this.refreshMatrix();
+      const profileId = args.get("profileId");
+      if (profileId) {
+        this.selectedProfile = this.profiles.find(profile => profile.profileId === profileId || profile.id === profileId) || null;
+        if (!this.selectedProfile) {
+          const found = await getPermissionSetsByIds([profileId]);
+          this.selectedProfile = found[0] || null;
+        }
+      }
+
+      const parentIds = (args.get("parentIds") || "").split(",").map(id => id.trim()).filter(Boolean);
+      if (parentIds.length) {
+        this.selectedParents = await getPermissionSetsByIds(parentIds);
+      }
+
+      await this.refreshMatrix();
+    } catch (err) {
+      this.errorMessage = err.message || String(err);
+    }
   }
 
   syncUrl() {
     const args = new URLSearchParams();
     args.set("host", this.sfHost);
     args.set("mode", this.mode);
+    args.set("section", this.section);
     if (this.selectedObject) {
       args.set("objectType", this.selectedObject.name);
     }
@@ -138,10 +176,21 @@ class Model {
   setMode(mode) {
     this.mode = mode;
     this.matrix = null;
-    this.profileOlsRows = null;
+    this.objectRows = [];
+    this.userPerms = [];
+    this.customPerms = [];
+    this.summary = null;
     this.errorMessage = null;
+    if (mode !== "fields") {
+      this.section = this.section === "fields" && !this.selectedObject ? "objects" : this.section;
+    }
     this.syncUrl();
     this.spinFor(this.refreshMatrix());
+  }
+
+  setSection(section) {
+    this.section = section;
+    this.syncUrl();
   }
 
   setUserQuery(value) {
@@ -190,7 +239,7 @@ class Model {
     this.selectedUser = null;
     this.userQuery = "";
     this.parents = [];
-    this.matrix = null;
+    this.clearResults();
     this.syncUrl();
   }
 
@@ -220,8 +269,12 @@ class Model {
   clearObject() {
     this.selectedObject = null;
     this.objectQuery = "";
-    this.matrix = null;
+    this.matrix = this.matrix ? Object.assign({}, this.matrix, {fls: []}) : null;
+    if (this.section === "fields") {
+      this.section = "objects";
+    }
     this.syncUrl();
+    this.spinFor(this.refreshMatrix());
   }
 
   async selectProfile(profileId) {
@@ -232,6 +285,7 @@ class Model {
 
   setPermSetQuery(value) {
     this.permSetQuery = value;
+    this.showPermSetResults = true;
     if (this.permSetSearchTimer) {
       clearTimeout(this.permSetSearchTimer);
     }
@@ -248,12 +302,26 @@ class Model {
   async runPermSetSearch(term) {
     try {
       const results = await searchPermissionSets(term);
-      const selected = new Set(this.selectedParents.map(parent => parent.id));
-      this.permSetResults = results.filter(parent => !selected.has(parent.id));
+      if (this.mode === "profile") {
+        this.permSetResults = results;
+      } else {
+        const selected = new Set(this.selectedParents.map(parent => parent.id));
+        this.permSetResults = results.filter(parent => !selected.has(parent.id));
+      }
+      this.showPermSetResults = true;
     } catch (err) {
       this.errorMessage = err.message;
       this.permSetResults = [];
     }
+  }
+
+  async selectScopeParent(parent) {
+    this.selectedProfile = parent;
+    this.permSetQuery = "";
+    this.permSetResults = [];
+    this.showPermSetResults = false;
+    this.syncUrl();
+    await this.refreshMatrix();
   }
 
   async addParent(parent) {
@@ -262,6 +330,8 @@ class Model {
     }
     this.selectedParents = this.selectedParents.concat(parent);
     this.permSetResults = this.permSetResults.filter(item => item.id !== parent.id);
+    this.permSetQuery = "";
+    this.showPermSetResults = false;
     this.syncUrl();
     await this.refreshMatrix();
   }
@@ -281,87 +351,138 @@ class Model {
 
   switchToUserMode() {
     this.mode = "user";
-    this.matrix = null;
-    this.profileOlsRows = null;
+    this.errorMessage = null;
     this.syncUrl();
+    this.spinFor(this.refreshMatrix());
   }
 
-  canLoadMatrix() {
+  canLoad() {
     if (this.mode === "user") {
-      return !!(this.selectedUser && this.selectedObject);
+      return !!this.selectedUser;
     }
     if (this.mode === "object") {
-      return !!(this.selectedObject && this.selectedParents.length);
+      return !!this.selectedObject;
     }
-    if (this.mode === "profile") {
-      return !!this.selectedProfile;
-    }
-    return false;
+    return !!this.selectedProfile;
+  }
+
+  clearResults() {
+    this.matrix = null;
+    this.objectRows = [];
+    this.userPerms = [];
+    this.customPerms = [];
+    this.summary = null;
   }
 
   async refreshMatrix() {
     const gen = ++this.loadGen;
     this.errorMessage = null;
-    if (!this.canLoadMatrix()) {
-      this.matrix = null;
-      if (this.mode !== "profile") {
-        this.profileOlsRows = null;
-      }
+    this.infoMessage = null;
+    if (!this.canLoad()) {
+      this.clearResults();
       return;
     }
     try {
+      let parents = [];
+      let objectPerms = [];
       if (this.mode === "user") {
-        const parents = this.parents.length ? this.parents : await getUserAssignments(this.selectedUser.Id);
+        parents = this.parents.length ? this.parents : await getUserAssignments(this.selectedUser.Id);
+        this.parents = parents;
+        objectPerms = await getObjectPermissions(parents.map(parent => parent.id));
+      } else if (this.mode === "object") {
+        const loaded = await getParentsForSobject(this.selectedObject.name);
         if (gen !== this.loadGen) {
           return;
         }
+        const extra = this.selectedParents.filter(parent => !loaded.parents.some(item => item.id === parent.id));
+        parents = loaded.parents.concat(extra);
         this.parents = parents;
-        this.profileOlsRows = null;
-        this.matrix = await this.loadObjectMatrix(parents, this.selectedObject.name, gen);
-        return;
+        objectPerms = loaded.objectPerms;
+        if (extra.length) {
+          const extraPerms = await getObjectPermissions(extra.map(parent => parent.id), this.selectedObject.name);
+          objectPerms = objectPerms.concat(extraPerms);
+        }
+      } else {
+        parents = [this.selectedProfile];
+        this.parents = parents;
+        objectPerms = await getObjectPermissions([this.selectedProfile.id]);
       }
-      if (this.mode === "object") {
-        this.parents = this.selectedParents;
-        this.profileOlsRows = null;
-        this.matrix = await this.loadObjectMatrix(this.selectedParents, this.selectedObject.name, gen);
-        return;
-      }
-      const parent = this.selectedProfile;
-      this.parents = [parent];
-      this.profileOlsRows = await getProfileObjectPermissions(parent.id);
       if (gen !== this.loadGen) {
         return;
       }
+
+      const parentIds = parents.map(parent => parent.id);
+      const fieldNames = this.systemPermFields.map(field => field.name);
+      const [flagRecords, customAccess, fieldBundle] = await Promise.all([
+        getPermissionSetFlags(parentIds, fieldNames),
+        getCustomPermissionAccess(parentIds),
+        this.selectedObject
+          ? this.loadFieldBundle(parentIds, this.selectedObject.name)
+          : Promise.resolve({fields: [], fieldPerms: []})
+      ]);
+      if (gen !== this.loadGen) {
+        return;
+      }
+
+      const matrix = this.selectedObject
+        ? buildMatrix({
+          fields: fieldBundle.fields,
+          parents,
+          objectPerms: this.mode === "object" ? objectPerms : objectPerms.filter(row => row.SobjectType === this.selectedObject.name),
+          fieldPerms: fieldBundle.fieldPerms,
+          sobject: this.selectedObject.name,
+          sobjectLabels: this.sobjectLabels
+        })
+        : {ols: null, fls: [], objectRows: []};
+
+      this.objectRows = this.mode === "object"
+        ? (matrix.objectRows || buildObjectRows({parents, objectPerms, sobjectLabels: this.sobjectLabels}))
+        : buildObjectRows({parents, objectPerms, sobjectLabels: this.sobjectLabels});
+      this.matrix = matrix;
+      this.userPerms = buildUserPerms({parents, fields: this.systemPermFields, records: flagRecords});
+      this.customPerms = buildCustomPerms({
+        parents,
+        accessRows: customAccess.accessRows,
+        customPerms: customAccess.customPerms
+      });
+      this.summary = summarizeSnapshot({
+        parents,
+        objectRows: this.objectRows,
+        userPerms: this.userPerms,
+        customPerms: this.customPerms
+      });
       if (this.selectedObject) {
-        this.matrix = await this.loadObjectMatrix([parent], this.selectedObject.name, gen);
-      } else {
-        this.matrix = null;
+        this.infoMessage = "Field list is limited to fields you can describe.";
       }
     } catch (err) {
-      if (gen !== this.loadGen) {
-        return;
-      }
-      this.matrix = null;
-      this.profileOlsRows = null;
-      this.errorMessage = err.message;
+      this.clearResults();
+      this.errorMessage = err.message || String(err);
     }
   }
 
-  async loadObjectMatrix(parents, sobject, gen) {
-    const parentIds = parents.map(parent => parent.id);
-    const [fields, objectPerms, fieldPerms] = await Promise.all([
+  async loadFieldBundle(parentIds, sobject) {
+    const [fields, fieldPerms] = await Promise.all([
       describeFields(sobject),
-      getObjectPermissions(parentIds, sobject),
       getFieldPermissions(parentIds, sobject)
     ]);
-    if (gen !== this.loadGen) {
-      return this.matrix;
-    }
-    return buildMatrix({fields, parents, objectPerms, fieldPerms, sobject});
+    return {fields, fieldPerms};
+  }
+
+  filteredObjectRows() {
+    const term = this.objectFilter.trim().toLowerCase();
+    return this.objectRows.filter(row => {
+      if (this.hideNoAccess && !OLS_KEYS.some(item => row.effective[item.key])) {
+        return false;
+      }
+      if (!term) {
+        return true;
+      }
+      return row.sobject.toLowerCase().includes(term) || (row.label && row.label.toLowerCase().includes(term));
+    });
   }
 
   filteredFls() {
-    if (!this.matrix) {
+    if (!this.matrix || !this.matrix.fls) {
       return [];
     }
     const term = this.fieldFilter.trim().toLowerCase();
@@ -375,21 +496,35 @@ class Model {
       if (!term) {
         return true;
       }
-      return field.name.toLowerCase().includes(term) || String(field.label).toLowerCase().includes(term);
+      return field.name.toLowerCase().includes(term) || (field.label && field.label.toLowerCase().includes(term));
     });
   }
 
-  filteredProfileOls() {
-    const rows = this.profileOlsRows || [];
-    const term = this.objectFilter.trim().toLowerCase();
+  filteredUserPerms() {
+    const term = this.permFilter.trim().toLowerCase();
+    return this.userPerms.filter(perm => {
+      if (this.hideUngrantedUserPerms && !perm.granted) {
+        return false;
+      }
+      if (!term) {
+        return true;
+      }
+      return perm.label.toLowerCase().includes(term) || perm.key.toLowerCase().includes(term);
+    });
+  }
+
+  filteredCustomPerms() {
+    const term = this.permFilter.trim().toLowerCase();
     if (!term) {
-      return rows;
+      return this.customPerms;
     }
-    return rows.filter(row => String(row.SobjectType).toLowerCase().includes(term));
+    return this.customPerms.filter(perm =>
+      perm.label.toLowerCase().includes(term) || perm.name.toLowerCase().includes(term)
+    );
   }
 
   csvFileName() {
-    const parts = ["permission-matrix", this.mode];
+    const parts = ["permissions", this.mode];
     if (this.selectedUser) {
       parts.push(this.selectedUser.Username || this.selectedUser.Name);
     }
@@ -402,30 +537,31 @@ class Model {
     return parts.join("-").replace(/[^\w.-]+/g, "_") + ".csv";
   }
 
-  exportCsv() {
-    const csv = matrixToCsv({
+  buildCsv() {
+    const filteredMatrix = this.matrix
+      ? Object.assign({}, this.matrix, {fls: this.filteredFls()})
+      : null;
+    return matrixToCsv({
       mode: this.mode,
       objectName: this.selectedObject ? this.selectedObject.name : "",
       parents: this.parents,
-      matrix: this.matrix,
-      profileOlsRows: this.filteredProfileOls()
+      matrix: filteredMatrix,
+      objectRows: this.filteredObjectRows(),
+      userPerms: this.hideUngrantedUserPerms ? this.userPerms.filter(item => item.granted) : this.userPerms,
+      customPerms: this.customPerms
     });
-    downloadCsvFile(csv, this.csvFileName());
+  }
+
+  exportCsv() {
+    downloadCsvFile(this.buildCsv(), this.csvFileName());
   }
 
   copyCsv() {
-    const csv = matrixToCsv({
-      mode: this.mode,
-      objectName: this.selectedObject ? this.selectedObject.name : "",
-      parents: this.parents,
-      matrix: this.matrix,
-      profileOlsRows: this.filteredProfileOls()
-    });
-    copyToClipboard(csv);
+    copyToClipboard(this.buildCsv());
   }
 
   hasExport() {
-    return !!(this.matrix || (this.profileOlsRows && this.profileOlsRows.length));
+    return !!(this.objectRows.length || (this.matrix && this.matrix.fls && this.matrix.fls.length) || this.userPerms.length || this.customPerms.length);
   }
 }
 
@@ -439,10 +575,15 @@ function accessCell(granted, always) {
   return h("span", {className: "pm-cell-false"}, "No");
 }
 
+function sourceText(sources) {
+  return (sources || []).join(", ");
+}
+
 class App extends React.Component {
   constructor(props) {
     super(props);
     this.onModeChange = this.onModeChange.bind(this);
+    this.onSectionChange = this.onSectionChange.bind(this);
     this.onUserQuery = this.onUserQuery.bind(this);
     this.onSelectUser = this.onSelectUser.bind(this);
     this.onClearUser = this.onClearUser.bind(this);
@@ -453,11 +594,14 @@ class App extends React.Component {
     this.onProfileParentChange = this.onProfileParentChange.bind(this);
     this.onPermSetQuery = this.onPermSetQuery.bind(this);
     this.onAddPermSet = this.onAddPermSet.bind(this);
+    this.onSelectScopeParent = this.onSelectScopeParent.bind(this);
     this.onRemoveParent = this.onRemoveParent.bind(this);
     this.onFieldFilter = this.onFieldFilter.bind(this);
     this.onObjectFilter = this.onObjectFilter.bind(this);
+    this.onPermFilter = this.onPermFilter.bind(this);
     this.onToggleHideNoAccess = this.onToggleHideNoAccess.bind(this);
     this.onToggleHideNonPermissionable = this.onToggleHideNonPermissionable.bind(this);
+    this.onToggleHideUngranted = this.onToggleHideUngranted.bind(this);
     this.onExportCsv = this.onExportCsv.bind(this);
     this.onCopyCsv = this.onCopyCsv.bind(this);
     this.onSwitchToUser = this.onSwitchToUser.bind(this);
@@ -474,112 +618,118 @@ class App extends React.Component {
 
   onDocumentClick() {
     let {model} = this.props;
-    if (model.showUserResults || model.showObjectResults) {
+    if (model.showUserResults || model.showObjectResults || model.showPermSetResults) {
       model.showUserResults = false;
       model.showObjectResults = false;
+      model.showPermSetResults = false;
       model.didUpdate();
     }
   }
 
   onModeChange(e) {
-    let {model} = this.props;
-    model.setMode(e.target.value);
-    model.didUpdate();
+    this.props.model.setMode(e.target.value);
+    this.props.model.didUpdate();
+  }
+
+  onSectionChange(key) {
+    this.props.model.setSection(key);
+    this.props.model.didUpdate();
   }
 
   onUserQuery(e) {
     e.stopPropagation();
-    let {model} = this.props;
-    model.setUserQuery(e.target.value);
-    model.didUpdate();
+    this.props.model.setUserQuery(e.target.value);
+    this.props.model.didUpdate();
   }
 
   onSelectUser(user) {
-    let {model} = this.props;
-    model.spinFor(model.selectUser(user));
-    model.didUpdate();
+    this.props.model.spinFor(this.props.model.selectUser(user));
+    this.props.model.didUpdate();
   }
 
   onClearUser() {
-    let {model} = this.props;
-    model.clearUser();
-    model.didUpdate();
+    this.props.model.clearUser();
+    this.props.model.didUpdate();
   }
 
   onObjectQuery(e) {
     e.stopPropagation();
-    let {model} = this.props;
-    model.setObjectQuery(e.target.value);
-    model.didUpdate();
+    this.props.model.setObjectQuery(e.target.value);
+    this.props.model.didUpdate();
   }
 
   onSelectObject(obj) {
-    let {model} = this.props;
-    model.spinFor(model.selectObject(obj));
-    model.didUpdate();
+    this.props.model.spinFor(this.props.model.selectObject(obj));
+    this.props.model.didUpdate();
   }
 
   onClearObject() {
-    let {model} = this.props;
-    model.clearObject();
-    model.didUpdate();
+    this.props.model.clearObject();
+    this.props.model.didUpdate();
   }
 
   onSelectProfile(e) {
-    let {model} = this.props;
-    model.spinFor(model.selectProfile(e.target.value));
-    model.didUpdate();
+    this.props.model.spinFor(this.props.model.selectProfile(e.target.value));
+    this.props.model.didUpdate();
   }
 
   onProfileParentChange(e) {
-    let {model} = this.props;
     if (e.target.value) {
-      model.spinFor(model.addProfileParent(e.target.value));
+      this.props.model.spinFor(this.props.model.addProfileParent(e.target.value));
     }
     e.target.value = "";
-    model.didUpdate();
+    this.props.model.didUpdate();
   }
 
   onPermSetQuery(e) {
-    let {model} = this.props;
-    model.setPermSetQuery(e.target.value);
-    model.didUpdate();
+    e.stopPropagation();
+    this.props.model.setPermSetQuery(e.target.value);
+    this.props.model.didUpdate();
   }
 
   onAddPermSet(parent) {
-    let {model} = this.props;
-    model.spinFor(model.addParent(parent));
-    model.didUpdate();
+    this.props.model.spinFor(this.props.model.addParent(parent));
+    this.props.model.didUpdate();
+  }
+
+  onSelectScopeParent(parent) {
+    this.props.model.spinFor(this.props.model.selectScopeParent(parent));
+    this.props.model.didUpdate();
   }
 
   onRemoveParent(parentId) {
-    let {model} = this.props;
-    model.spinFor(model.removeParent(parentId));
-    model.didUpdate();
+    this.props.model.spinFor(this.props.model.removeParent(parentId));
+    this.props.model.didUpdate();
   }
 
   onFieldFilter(e) {
-    let {model} = this.props;
-    model.fieldFilter = e.target.value;
-    model.didUpdate();
+    this.props.model.fieldFilter = e.target.value;
+    this.props.model.didUpdate();
   }
 
   onObjectFilter(e) {
-    let {model} = this.props;
-    model.objectFilter = e.target.value;
-    model.didUpdate();
+    this.props.model.objectFilter = e.target.value;
+    this.props.model.didUpdate();
+  }
+
+  onPermFilter(e) {
+    this.props.model.permFilter = e.target.value;
+    this.props.model.didUpdate();
   }
 
   onToggleHideNoAccess(e) {
-    let {model} = this.props;
-    model.hideNoAccess = e.target.checked;
-    model.didUpdate();
+    this.props.model.hideNoAccess = e.target.checked;
+    this.props.model.didUpdate();
   }
 
   onToggleHideNonPermissionable(e) {
-    let {model} = this.props;
-    model.hideNonPermissionable = e.target.checked;
-    model.didUpdate();
+    this.props.model.hideNonPermissionable = e.target.checked;
+    this.props.model.didUpdate();
+  }
+
+  onToggleHideUngranted(e) {
+    this.props.model.hideUngrantedUserPerms = e.target.checked;
+    this.props.model.didUpdate();
   }
 
   onExportCsv() {
@@ -592,9 +742,23 @@ class App extends React.Component {
 
   onSwitchToUser(e) {
     e.preventDefault();
-    let {model} = this.props;
-    model.switchToUserMode();
-    model.didUpdate();
+    this.props.model.switchToUserMode();
+    this.props.model.didUpdate();
+  }
+
+  renderDropdown(items, onPick, labelFn, keyFn) {
+    if (!items.length) {
+      return null;
+    }
+    return h("div", {className: "pm-dropdown", role: "listbox"},
+      items.map(item =>
+        h("button", {
+          type: "button",
+          key: keyFn(item),
+          onClick: () => onPick(item)
+        }, labelFn(item))
+      )
+    );
   }
 
   renderUserPicker(model) {
@@ -603,6 +767,7 @@ class App extends React.Component {
       h("div", {className: "slds-form-element__control pm-relative", onClick: e => e.stopPropagation()},
         h("input", {
           id: "pm-user",
+          "data-testid": "pm-user-input",
           className: "slds-input",
           type: "search",
           placeholder: "Search name, username, email, or alias",
@@ -612,21 +777,16 @@ class App extends React.Component {
         }),
         model.selectedUser
           ? h("div", {className: "pm-selected-chip"},
-            h("span", {className: "slds-badge"}, model.selectedUser.Username || model.selectedUser.Name),
+            h("span", {className: "slds-badge", "data-testid": "pm-selected-user"}, model.selectedUser.Username || model.selectedUser.Name),
             h("button", {className: "slds-button slds-button_neutral slds-button_small", onClick: this.onClearUser, type: "button"}, "Clear")
           )
           : null,
         model.showUserResults && model.userResults.length
-          ? h("div", {className: "pm-dropdown", role: "listbox"},
-            model.userResults.map(user =>
-              h("button", {
-                type: "button",
-                key: user.Id,
-                onClick: () => this.onSelectUser(user)
-              },
-              user.Name + " — " + user.Username + (user.IsActive ? "" : " (Inactive)")
-              )
-            )
+          ? this.renderDropdown(
+            model.userResults,
+            this.onSelectUser,
+            user => user.Name + " — " + user.Username + (user.IsActive ? "" : " (Inactive)"),
+            user => user.Id
           )
           : null
       )
@@ -639,30 +799,26 @@ class App extends React.Component {
       h("div", {className: "slds-form-element__control pm-relative", onClick: e => e.stopPropagation()},
         h("input", {
           id: "pm-object",
+          "data-testid": "pm-object-input",
           className: "slds-input",
           type: "search",
-          placeholder: "Search object API name or label",
+          placeholder: model.mode === "user" ? "Optional. Pick an object for FLS" : "Search objects",
           value: model.objectQuery,
           onChange: this.onObjectQuery,
           onFocus: this.onObjectQuery
         }),
         model.selectedObject
           ? h("div", {className: "pm-selected-chip"},
-            h("span", {className: "slds-badge"}, model.selectedObject.name + (model.selectedObject.label ? " (" + model.selectedObject.label + ")" : "")),
+            h("span", {className: "slds-badge", "data-testid": "pm-selected-object"}, model.selectedObject.name),
             h("button", {className: "slds-button slds-button_neutral slds-button_small", onClick: this.onClearObject, type: "button"}, "Clear")
           )
           : null,
         model.showObjectResults && model.objectResults.length
-          ? h("div", {className: "pm-dropdown", role: "listbox"},
-            model.objectResults.map(obj =>
-              h("button", {
-                type: "button",
-                key: obj.name,
-                onClick: () => this.onSelectObject(obj)
-              },
-              obj.name + (obj.label ? " (" + obj.label + ")" : "")
-              )
-            )
+          ? this.renderDropdown(
+            model.objectResults,
+            this.onSelectObject,
+            obj => obj.label + " (" + obj.name + ")",
+            obj => obj.name
           )
           : null
       )
@@ -673,69 +829,96 @@ class App extends React.Component {
     return h("div", {className: "slds-form-element"},
       h("label", {className: "slds-form-element__label", htmlFor: "pm-profile"}, "Profile"),
       h("div", {className: "slds-form-element__control"},
-        h("div", {className: "slds-select_container"},
-          h("select", {
-            id: "pm-profile",
-            className: "slds-select",
-            value: model.selectedProfile ? model.selectedProfile.id : "",
-            onChange: this.onSelectProfile
-          },
-          h("option", {value: ""}, "Select a profile"),
-          model.profiles.map(profile =>
-            h("option", {key: profile.id, value: profile.id}, profile.label)
-          )
-          )
+        h("select", {
+          id: "pm-profile",
+          "data-testid": "pm-profile-select",
+          className: "slds-select",
+          value: model.selectedProfile && model.selectedProfile.kind === "profile" ? model.selectedProfile.id : "",
+          onChange: this.onSelectProfile
+        },
+        h("option", {value: ""}, "Select a profile"),
+        model.profiles.map(profile =>
+          h("option", {key: profile.id, value: profile.id}, profile.label)
+        )
         )
       )
     );
   }
 
+  renderScopeSearch(model) {
+    return h("div", {className: "slds-form-element"},
+      h("label", {className: "slds-form-element__label", htmlFor: "pm-scope-ps"}, "Permission set"),
+      h("div", {className: "slds-form-element__control pm-relative", onClick: e => e.stopPropagation()},
+        h("input", {
+          id: "pm-scope-ps",
+          "data-testid": "pm-scope-ps-input",
+          className: "slds-input",
+          type: "search",
+          placeholder: "Search a permission set instead of a profile",
+          value: model.permSetQuery,
+          onChange: this.onPermSetQuery,
+          onFocus: this.onPermSetQuery
+        }),
+        model.selectedProfile && model.selectedProfile.kind !== "profile"
+          ? h("div", {className: "pm-selected-chip"},
+            h("span", {className: "slds-badge"}, parentKindLabel(model.selectedProfile.kind) + ": " + model.selectedProfile.label)
+          )
+          : null,
+        model.showPermSetResults && model.permSetResults.length
+          ? this.renderDropdown(
+            model.permSetResults,
+            this.onSelectScopeParent,
+            parent => parent.label,
+            parent => parent.id
+          )
+          : null
+      )
+    );
+  }
+
   renderParentPicker(model) {
-    return h("div", {className: "slds-grid slds-gutters_small slds-wrap"},
-      h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"},
-        h("div", {className: "slds-form-element"},
-          h("label", {className: "slds-form-element__label", htmlFor: "pm-add-profile"}, "Add Profile"),
-          h("div", {className: "slds-form-element__control"},
-            h("div", {className: "slds-select_container"},
-              h("select", {id: "pm-add-profile", className: "slds-select", value: "", onChange: this.onProfileParentChange},
-                h("option", {value: ""}, "Select a profile to add"),
-                model.profiles
-                  .filter(profile => !model.selectedParents.some(parent => parent.id === profile.id))
-                  .map(profile => h("option", {key: profile.id, value: profile.id}, profile.label))
+    return h("div", {"data-testid": "pm-parent-picker"},
+      h("div", {className: "slds-grid slds-gutters_small slds-wrap"},
+        h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"},
+          h("div", {className: "slds-form-element"},
+            h("label", {className: "slds-form-element__label", htmlFor: "pm-add-profile"}, "Add profile"),
+            h("div", {className: "slds-form-element__control"},
+              h("select", {id: "pm-add-profile", className: "slds-select", defaultValue: "", onChange: this.onProfileParentChange},
+                h("option", {value: ""}, "Add a profile column"),
+                model.profiles.map(profile =>
+                  h("option", {key: profile.id, value: profile.id}, profile.label)
+                )
               )
+            )
+          )
+        ),
+        h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"},
+          h("div", {className: "slds-form-element"},
+            h("label", {className: "slds-form-element__label", htmlFor: "pm-add-ps"}, "Add permission set"),
+            h("div", {className: "slds-form-element__control pm-relative", onClick: e => e.stopPropagation()},
+              h("input", {
+                id: "pm-add-ps",
+                className: "slds-input",
+                type: "search",
+                placeholder: "Search permission sets",
+                value: model.permSetQuery,
+                onChange: this.onPermSetQuery,
+                onFocus: this.onPermSetQuery
+              }),
+              model.showPermSetResults && model.permSetResults.length
+                ? this.renderDropdown(
+                  model.permSetResults,
+                  this.onAddPermSet,
+                  parent => parent.label,
+                  parent => parent.id
+                )
+                : null
             )
           )
         )
       ),
-      h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"},
-        h("div", {className: "slds-form-element"},
-          h("label", {className: "slds-form-element__label", htmlFor: "pm-permset"}, "Add Permission Set or Group"),
-          h("div", {className: "slds-form-element__control"},
-            h("input", {
-              id: "pm-permset",
-              className: "slds-input",
-              type: "search",
-              placeholder: "Search permission sets",
-              value: model.permSetQuery,
-              onChange: this.onPermSetQuery
-            }),
-            model.permSetResults.length
-              ? h("div", {className: "pm-picker-list slds-m-top_xx-small"},
-                model.permSetResults.map(parent =>
-                  h("button", {
-                    type: "button",
-                    key: parent.id,
-                    className: "slds-button slds-button_neutral slds-m-around_xxx-small",
-                    onClick: () => this.onAddPermSet(parent)
-                  }, parentKindLabel(parent.kind) + ": " + parent.label)
-                )
-              )
-              : null
-          )
-        )
-      ),
       model.selectedParents.length
-        ? h("div", {className: "slds-col slds-size_1-of-1 slds-m-top_x-small"},
+        ? h("div", {className: "slds-m-top_x-small"},
           model.selectedParents.map(parent =>
             h("span", {key: parent.id, className: "slds-badge slds-m-right_xx-small slds-m-bottom_xx-small"},
               parentKindLabel(parent.kind) + ": " + parent.label + " ",
@@ -752,23 +935,48 @@ class App extends React.Component {
     );
   }
 
+  renderSummary(model) {
+    if (!model.summary) {
+      return null;
+    }
+    const items = [
+      {label: "Assignments", value: String(model.summary.assignmentCount)},
+      {label: "Objects with access", value: String(model.summary.objectCount)},
+      {label: "Create", value: String(model.summary.createCount)},
+      {label: "User permissions", value: String(model.summary.userPermCount)},
+      {label: "Custom permissions", value: String(model.summary.customPermCount)},
+      {label: "View All Data", value: model.summary.viewAllData ? "Yes" : "No", warn: model.summary.viewAllData},
+      {label: "Modify All Data", value: model.summary.modifyAllData ? "Yes" : "No", warn: model.summary.modifyAllData}
+    ];
+    return h("div", {className: "pm-summary", "data-testid": "pm-summary"},
+      items.map(item =>
+        h("div", {key: item.label, className: "pm-summary-card" + (item.warn ? " pm-summary-card_warn" : "")},
+          h("div", {className: "pm-summary-label"}, item.label),
+          h("div", {className: "pm-summary-value"}, item.value)
+        )
+      )
+    );
+  }
+
   renderToolbar(model) {
     return h("div", {className: "slds-grid slds-grid_align-spread slds-grid_vertical-align-center slds-wrap"},
       h("div", {className: "slds-col"},
         h("p", {className: "slds-text-body_small slds-text-color_weak"},
-          "Read-only. Object and field permissions come from Profile, Permission Set, and Permission Set Group assignments. This tool does not write FLS or OLS. See issue #688 for copy/paste editing."
+          "Read-only. Effective access is Profile, Permission Set, and Permission Set Group assignments. This page does not write FLS or OLS."
         )
       ),
       h("div", {className: "slds-col slds-text-align_right slds-m-left_small"},
         h("button", {
           type: "button",
           className: "slds-button slds-button_neutral",
+          "data-testid": "pm-copy-csv",
           disabled: !model.hasExport(),
           onClick: this.onCopyCsv
         }, "Copy CSV"),
         h("button", {
           type: "button",
           className: "slds-button slds-button_brand",
+          "data-testid": "pm-export-csv",
           disabled: !model.hasExport(),
           onClick: this.onExportCsv
         }, "Export CSV")
@@ -776,85 +984,95 @@ class App extends React.Component {
     );
   }
 
-  renderOlsTable(model) {
-    if (model.mode === "profile") {
-      const rows = model.filteredProfileOls();
-      return h("div", {className: "slds-card slds-m-around_medium"},
-        h("div", {className: "slds-card__header slds-grid slds-grid_align-spread slds-grid_vertical-align-center"},
-          h("h3", {className: "slds-card__header-title"}, "Object permissions"),
-          h("div", {className: "slds-form-element"},
-            h("input", {
-              className: "slds-input",
-              type: "search",
-              placeholder: "Filter objects",
-              value: model.objectFilter,
-              onChange: this.onObjectFilter
-            })
+  renderSections(model) {
+    return h("div", {className: "slds-tabs_default slds-m-top_small", "data-testid": "pm-sections"},
+      h("ul", {className: "slds-tabs_default__nav", role: "tablist"},
+        SECTIONS.map(item =>
+          h("li", {
+            key: item.key,
+            className: "slds-tabs_default__item" + (model.section === item.key ? " slds-is-active" : ""),
+            title: item.label,
+            role: "presentation"
+          },
+          h("a", {
+            className: "slds-tabs_default__link",
+            href: "#",
+            role: "tab",
+            "data-testid": "pm-section-" + item.key,
+            "aria-selected": model.section === item.key ? "true" : "false",
+            onClick: e => {
+              e.preventDefault();
+              this.onSectionChange(item.key);
+            }
+          }, item.label)
           )
-        ),
-        h("div", {className: "slds-card__body slds-card__body_inner"},
-          rows.length
-            ? h("div", {className: "pm-table-wrap"},
-              h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped"},
-                h("thead", {},
-                  h("tr", {},
-                    h("th", {scope: "col"}, "Object"),
-                    OLS_KEYS.map(item => h("th", {key: item.key, scope: "col"}, item.label))
-                  )
-                ),
-                h("tbody", {},
-                  rows.map(record =>
-                    h("tr", {key: record.SobjectType},
-                      h("th", {scope: "row"}, record.SobjectType),
-                      OLS_KEYS.map(item =>
-                        h("td", {key: item.key}, accessCell(!!record[item.field], false))
-                      )
-                    )
-                  )
-                )
-              )
-            )
-            : h("p", {}, model.selectedProfile ? "No object permissions found for this profile." : "Select a profile.")
         )
-      );
-    }
+      )
+    );
+  }
 
-    if (!model.matrix) {
-      return null;
+  renderObjectTable(model) {
+    const rows = model.filteredObjectRows();
+    const isObjectMode = model.mode === "object";
+    if (!model.canLoad()) {
+      return h("p", {"data-testid": "pm-empty"}, this.emptyMessage(model));
     }
-    const parents = model.parents;
-    return h("div", {className: "slds-card slds-m-around_medium"},
-      h("div", {className: "slds-card__header"},
-        h("h3", {className: "slds-card__header-title"}, "Object permissions" + (model.selectedObject ? " — " + model.selectedObject.name : ""))
+    if (!rows.length) {
+      return h("p", {"data-testid": "pm-empty"}, "No object permissions match the filter.");
+    }
+    return h("div", {},
+      h("div", {className: "slds-grid slds-grid_align-spread slds-grid_vertical-align-center slds-m-bottom_x-small slds-wrap"},
+        h("input", {
+          className: "slds-input pm-filter",
+          type: "search",
+          "data-testid": "pm-object-filter",
+          placeholder: "Filter objects",
+          value: model.objectFilter,
+          onChange: this.onObjectFilter
+        }),
+        h("label", {className: "slds-checkbox_toggle"},
+          h("span", {className: "slds-form-element__label"}, "Hide no access"),
+          h("input", {type: "checkbox", checked: model.hideNoAccess, onChange: this.onToggleHideNoAccess}),
+          h("span", {className: "slds-checkbox_faux_container"},
+            h("span", {className: "slds-checkbox_faux"}),
+            h("span", {className: "slds-checkbox_on"}, "On"),
+            h("span", {className: "slds-checkbox_off"}, "Off")
+          )
+        )
       ),
-      h("div", {className: "slds-card__body slds-card__body_inner"},
-        h("div", {className: "pm-table-wrap"},
-          h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped"},
-            h("thead", {},
-              h("tr", {},
+      h("p", {className: "slds-text-body_small slds-m-bottom_x-small"}, rows.length + " of " + model.objectRows.length + " objects"),
+      h("div", {className: "pm-table-wrap"},
+        h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped", "data-testid": "pm-ols-table"},
+          h("thead", {},
+            isObjectMode
+              ? h("tr", {},
                 h("th", {scope: "col"}, "Source"),
                 OLS_KEYS.map(item => h("th", {key: item.key, scope: "col"}, item.label))
               )
-            ),
-            h("tbody", {},
-              model.mode !== "object"
-                ? h("tr", {},
-                  h("th", {scope: "row"}, "Effective"),
-                  OLS_KEYS.map(item =>
-                    h("td", {key: item.key, title: (model.matrix.ols.sources[item.key] || []).join(", ")},
-                      accessCell(model.matrix.ols.effective[item.key], false)
-                    )
-                  )
-                )
-                : null,
-              parents.map(parent => {
-                const ols = model.matrix.ols.byParent[parent.id] || {};
+              : h("tr", {},
+                h("th", {scope: "col"}, "Object"),
+                h("th", {scope: "col"}, "Label"),
+                OLS_KEYS.map(item => h("th", {key: item.key, scope: "col"}, item.label))
+              )
+          ),
+          h("tbody", {},
+            isObjectMode
+              ? (rows[0] ? model.parents.map(parent => {
+                const ols = rows[0].byParent[parent.id] || {};
                 return h("tr", {key: parent.id},
                   h("th", {scope: "row"}, parentKindLabel(parent.kind) + ": " + parent.label),
                   OLS_KEYS.map(item => h("td", {key: item.key}, accessCell(!!ols[item.key], false)))
                 );
-              })
-            )
+              }) : null)
+              : rows.map(row =>
+                h("tr", {key: row.sobject},
+                  h("th", {scope: "row"}, row.sobject),
+                  h("td", {}, row.label),
+                  OLS_KEYS.map(item =>
+                    h("td", {key: item.key, title: sourceText(row.sources[item.key])}, accessCell(row.effective[item.key], false))
+                  )
+                )
+              )
           )
         )
       )
@@ -862,103 +1080,98 @@ class App extends React.Component {
   }
 
   renderFlsTable(model) {
+    if (!model.selectedObject) {
+      return h("p", {"data-testid": "pm-empty"}, "Pick an object to see field permissions.");
+    }
     if (!model.matrix) {
-      return h("div", {className: "slds-card slds-m-around_medium"},
-        h("div", {className: "slds-card__body slds-card__body_inner"},
-          h("p", {}, this.emptyMessage(model))
-        )
-      );
+      return h("p", {"data-testid": "pm-empty"}, this.emptyMessage(model));
     }
     const rows = model.filteredFls();
     const isObjectMode = model.mode === "object";
-    return h("div", {className: "slds-card slds-m-around_medium"},
-      h("div", {className: "slds-card__header slds-grid slds-wrap slds-grid_vertical-align-center"},
-        h("h3", {className: "slds-card__header-title slds-m-right_small"}, "Field permissions"),
-        h("div", {className: "slds-col slds-grid slds-grid_vertical-align-center slds-wrap"},
-          h("input", {
-            className: "slds-input slds-m-right_small",
-            type: "search",
-            placeholder: "Filter fields",
-            value: model.fieldFilter,
-            onChange: this.onFieldFilter
-          }),
-          h("label", {className: "slds-checkbox_toggle slds-m-right_small"},
-            h("span", {className: "slds-form-element__label"}, "Hide no access"),
-            h("input", {type: "checkbox", checked: model.hideNoAccess, onChange: this.onToggleHideNoAccess}),
-            h("span", {className: "slds-checkbox_faux_container"},
-              h("span", {className: "slds-checkbox_faux"}),
-              h("span", {className: "slds-checkbox_on"}, "On"),
-              h("span", {className: "slds-checkbox_off"}, "Off")
-            )
-          ),
-          h("label", {className: "slds-checkbox_toggle"},
-            h("span", {className: "slds-form-element__label"}, "Hide non-permissionable"),
-            h("input", {type: "checkbox", checked: model.hideNonPermissionable, onChange: this.onToggleHideNonPermissionable}),
-            h("span", {className: "slds-checkbox_faux_container"},
-              h("span", {className: "slds-checkbox_faux"}),
-              h("span", {className: "slds-checkbox_on"}, "On"),
-              h("span", {className: "slds-checkbox_off"}, "Off")
-            )
+    return h("div", {},
+      h("div", {className: "slds-grid slds-wrap slds-grid_vertical-align-center slds-m-bottom_x-small"},
+        h("input", {
+          className: "slds-input pm-filter slds-m-right_small",
+          type: "search",
+          "data-testid": "pm-field-filter",
+          placeholder: "Filter fields",
+          value: model.fieldFilter,
+          onChange: this.onFieldFilter
+        }),
+        h("label", {className: "slds-checkbox_toggle slds-m-right_small"},
+          h("span", {className: "slds-form-element__label"}, "Hide no access"),
+          h("input", {type: "checkbox", checked: model.hideNoAccess, onChange: this.onToggleHideNoAccess}),
+          h("span", {className: "slds-checkbox_faux_container"},
+            h("span", {className: "slds-checkbox_faux"}),
+            h("span", {className: "slds-checkbox_on"}, "On"),
+            h("span", {className: "slds-checkbox_off"}, "Off")
+          )
+        ),
+        h("label", {className: "slds-checkbox_toggle"},
+          h("span", {className: "slds-form-element__label"}, "Hide non-permissionable"),
+          h("input", {type: "checkbox", checked: model.hideNonPermissionable, onChange: this.onToggleHideNonPermissionable}),
+          h("span", {className: "slds-checkbox_faux_container"},
+            h("span", {className: "slds-checkbox_faux"}),
+            h("span", {className: "slds-checkbox_on"}, "On"),
+            h("span", {className: "slds-checkbox_off"}, "Off")
           )
         )
       ),
-      h("div", {className: "slds-card__body slds-card__body_inner"},
-        h("p", {className: "slds-text-body_small slds-m-bottom_x-small"}, rows.length + " of " + model.matrix.fls.length + " fields"),
-        h("div", {className: "pm-table-wrap"},
-          h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped"},
-            h("thead", {},
-              isObjectMode
-                ? h("tr", {},
-                  h("th", {scope: "col"}, "Field"),
+      h("p", {className: "slds-text-body_small slds-m-bottom_x-small"}, rows.length + " of " + model.matrix.fls.length + " fields"),
+      h("div", {className: "pm-table-wrap"},
+        h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped", "data-testid": "pm-fls-table"},
+          h("thead", {},
+            isObjectMode
+              ? [
+                h("tr", {key: "h1"},
+                  h("th", {scope: "col", className: "pm-sticky-corner"}, "Field"),
                   h("th", {scope: "col"}, "Label"),
                   model.parents.map(parent =>
                     h("th", {key: parent.id, scope: "col", colSpan: 2}, parent.label)
                   )
-                )
-                : h("tr", {},
-                  h("th", {scope: "col"}, "Field"),
-                  h("th", {scope: "col"}, "Label"),
-                  h("th", {scope: "col"}, "Type"),
-                  h("th", {scope: "col"}, "Read"),
-                  h("th", {scope: "col"}, "Edit"),
-                  h("th", {scope: "col"}, "Read source"),
-                  h("th", {scope: "col"}, "Edit source")
                 ),
-              isObjectMode
-                ? h("tr", {},
-                  h("th", {scope: "col"}, ""),
+                h("tr", {key: "h2", className: "pm-subhead"},
+                  h("th", {scope: "col", className: "pm-sticky-corner"}, ""),
                   h("th", {scope: "col"}, ""),
                   model.parents.flatMap(parent => [
                     h("th", {key: parent.id + "-r", scope: "col"}, "Read"),
                     h("th", {key: parent.id + "-e", scope: "col"}, "Edit")
                   ])
                 )
-                : null
-            ),
-            h("tbody", {},
-              rows.map(field =>
-                isObjectMode
-                  ? h("tr", {key: field.name},
-                    h("th", {scope: "row"}, field.name),
-                    h("td", {}, field.label),
-                    model.parents.flatMap(parent => {
-                      const cell = field.byParent[parent.id] || {read: false, edit: false};
-                      return [
-                        h("td", {key: parent.id + "-r"}, accessCell(cell.read, field.alwaysRead)),
-                        h("td", {key: parent.id + "-e"}, accessCell(cell.edit, field.alwaysEdit))
-                      ];
-                    })
-                  )
-                  : h("tr", {key: field.name},
-                    h("th", {scope: "row"}, field.name),
-                    h("td", {}, field.label),
-                    h("td", {}, field.type),
-                    h("td", {}, accessCell(field.effective.read, field.alwaysRead)),
-                    h("td", {}, accessCell(field.effective.edit, field.alwaysEdit)),
-                    h("td", {}, (field.sources.read || []).join(", ")),
-                    h("td", {}, (field.sources.edit || []).join(", "))
-                  )
+              ]
+              : h("tr", {},
+                h("th", {scope: "col"}, "Field"),
+                h("th", {scope: "col"}, "Label"),
+                h("th", {scope: "col"}, "Type"),
+                h("th", {scope: "col"}, "Read"),
+                h("th", {scope: "col"}, "Edit"),
+                h("th", {scope: "col"}, "Read source"),
+                h("th", {scope: "col"}, "Edit source")
               )
+          ),
+          h("tbody", {},
+            rows.map(field =>
+              isObjectMode
+                ? h("tr", {key: field.name},
+                  h("th", {scope: "row"}, field.name),
+                  h("td", {}, field.label),
+                  model.parents.flatMap(parent => {
+                    const cell = field.byParent[parent.id] || {read: false, edit: false};
+                    return [
+                      h("td", {key: parent.id + "-r"}, accessCell(cell.read, field.alwaysRead)),
+                      h("td", {key: parent.id + "-e"}, accessCell(cell.edit, field.alwaysEdit))
+                    ];
+                  })
+                )
+                : h("tr", {key: field.name},
+                  h("th", {scope: "row"}, field.name),
+                  h("td", {}, field.label),
+                  h("td", {}, field.type),
+                  h("td", {}, accessCell(field.effective.read, field.alwaysRead)),
+                  h("td", {}, accessCell(field.effective.edit, field.alwaysEdit)),
+                  h("td", {}, sourceText(field.sources.read)),
+                  h("td", {}, sourceText(field.sources.edit))
+                )
             )
           )
         )
@@ -966,21 +1179,125 @@ class App extends React.Component {
     );
   }
 
+  renderUserPermTable(model) {
+    if (!model.canLoad()) {
+      return h("p", {"data-testid": "pm-empty"}, this.emptyMessage(model));
+    }
+    const rows = model.filteredUserPerms();
+    return h("div", {},
+      h("div", {className: "slds-grid slds-grid_vertical-align-center slds-m-bottom_x-small slds-wrap"},
+        h("input", {
+          className: "slds-input pm-filter slds-m-right_small",
+          type: "search",
+          "data-testid": "pm-perm-filter",
+          placeholder: "Filter user permissions",
+          value: model.permFilter,
+          onChange: this.onPermFilter
+        }),
+        h("label", {className: "slds-checkbox_toggle"},
+          h("span", {className: "slds-form-element__label"}, "Granted only"),
+          h("input", {type: "checkbox", checked: model.hideUngrantedUserPerms, onChange: this.onToggleHideUngranted}),
+          h("span", {className: "slds-checkbox_faux_container"},
+            h("span", {className: "slds-checkbox_faux"}),
+            h("span", {className: "slds-checkbox_on"}, "On"),
+            h("span", {className: "slds-checkbox_off"}, "Off")
+          )
+        )
+      ),
+      h("p", {className: "slds-text-body_small slds-m-bottom_x-small"}, rows.length + " of " + model.userPerms.length + " user permissions"),
+      rows.length
+        ? h("div", {className: "pm-table-wrap"},
+          h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped", "data-testid": "pm-userperm-table"},
+            h("thead", {},
+              h("tr", {},
+                h("th", {scope: "col"}, "Permission"),
+                h("th", {scope: "col"}, "API name"),
+                h("th", {scope: "col"}, "Granted"),
+                h("th", {scope: "col"}, "Granted by")
+              )
+            ),
+            h("tbody", {},
+              rows.map(perm =>
+                h("tr", {key: perm.key},
+                  h("th", {scope: "row"}, perm.label),
+                  h("td", {}, perm.key),
+                  h("td", {}, accessCell(perm.granted, false)),
+                  h("td", {}, sourceText(perm.sources))
+                )
+              )
+            )
+          )
+        )
+        : h("p", {"data-testid": "pm-empty"}, "No user permissions match the filter.")
+    );
+  }
+
+  renderCustomPermTable(model) {
+    if (!model.canLoad()) {
+      return h("p", {"data-testid": "pm-empty"}, this.emptyMessage(model));
+    }
+    const rows = model.filteredCustomPerms();
+    return h("div", {},
+      h("input", {
+        className: "slds-input pm-filter slds-m-bottom_x-small",
+        type: "search",
+        placeholder: "Filter custom permissions",
+        value: model.permFilter,
+        onChange: this.onPermFilter
+      }),
+      rows.length
+        ? h("div", {className: "pm-table-wrap"},
+          h("table", {className: "slds-table slds-table_cell-buffer slds-table_bordered slds-table_striped", "data-testid": "pm-customperm-table"},
+            h("thead", {},
+              h("tr", {},
+                h("th", {scope: "col"}, "Label"),
+                h("th", {scope: "col"}, "API name"),
+                h("th", {scope: "col"}, "Granted by")
+              )
+            ),
+            h("tbody", {},
+              rows.map(perm =>
+                h("tr", {key: perm.key},
+                  h("th", {scope: "row"}, perm.label),
+                  h("td", {}, perm.name),
+                  h("td", {}, sourceText(perm.sources))
+                )
+              )
+            )
+          )
+        )
+        : h("p", {"data-testid": "pm-empty"}, "No custom permissions granted.")
+    );
+  }
+
   emptyMessage(model) {
     if (model.mode === "user") {
-      return "Select a user and an object to see effective OLS and FLS.";
+      return "Select a user to see effective object access, user permissions, and custom permissions.";
     }
     if (model.mode === "object") {
-      return "Select an object and at least one profile or permission set.";
+      return "Select an object to see which profiles and permission sets grant OLS. Add extra columns if you need them.";
     }
-    return "Select a profile to see object permissions. Optionally select an object for FLS.";
+    return "Select a profile or permission set to see its object, user, and custom permissions.";
+  }
+
+  renderBody(model) {
+    if (model.section === "fields") {
+      return this.renderFlsTable(model);
+    }
+    if (model.section === "userPerms") {
+      return this.renderUserPermTable(model);
+    }
+    if (model.section === "customPerms") {
+      return this.renderCustomPermTable(model);
+    }
+    return this.renderObjectTable(model);
   }
 
   render() {
     let {model} = this.props;
-    return h("div", {},
+    return h("div", {"data-testid": "pm-page"},
       h(PageHeader, {
-        pageTitle: "Permission Matrix",
+        pageTitle: "Permissions",
         orgName: model.orgName,
         sfLink: model.sfLink,
         sfHost: model.sfHost,
@@ -991,14 +1308,19 @@ class App extends React.Component {
         h("div", {className: "slds-card slds-m-around_medium"},
           h("div", {className: "slds-card__body slds-card__body_inner"},
             model.errorMessage
-              ? h("div", {className: "slds-notify slds-notify_alert slds-alert_error slds-m-bottom_small", role: "alert"},
+              ? h("div", {className: "slds-notify slds-notify_alert slds-alert_error slds-m-bottom_small", role: "alert", "data-testid": "pm-error"},
                 h("span", {}, model.errorMessage)
               )
               : null,
+            model.infoMessage
+              ? h("div", {className: "slds-notify slds-notify_alert slds-alert_offline slds-m-bottom_small", role: "status", "data-testid": "pm-info"},
+                h("span", {}, model.infoMessage)
+              )
+              : null,
             h("fieldset", {className: "slds-form-element slds-m-bottom_small"},
-              h("legend", {className: "slds-form-element__legend slds-form-element__label"}, "Mode"),
+              h("legend", {className: "slds-form-element__legend slds-form-element__label"}, "Lens"),
               h("div", {className: "slds-form-element__control"},
-                h("div", {className: "slds-radio_button-group"},
+                h("div", {className: "slds-radio_button-group", "data-testid": "pm-modes"},
                   MODES.map(item =>
                     h("span", {key: item.key, className: "slds-button slds-radio_button"},
                       h("input", {
@@ -1006,6 +1328,7 @@ class App extends React.Component {
                         id: "pm-mode-" + item.key,
                         name: "pm-mode",
                         value: item.key,
+                        "data-testid": "pm-mode-" + item.key,
                         checked: model.mode === item.key,
                         onChange: this.onModeChange
                       }),
@@ -1024,27 +1347,35 @@ class App extends React.Component {
               model.mode === "profile"
                 ? h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"}, this.renderProfilePicker(model))
                 : null,
+              model.mode === "profile"
+                ? h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"}, this.renderScopeSearch(model))
+                : null,
               h("div", {className: "slds-col slds-size_1-of-1 slds-medium-size_1-of-2"}, this.renderObjectPicker(model))
             ),
             model.mode === "object"
               ? h("div", {className: "slds-m-top_small"},
                 this.renderParentPicker(model),
                 h("p", {className: "slds-text-body_small slds-m-top_x-small"},
-                  h("a", {href: "#", onClick: this.onSwitchToUser}, "Switch to User mode"),
-                  " to see effective permissions for a user on this object."
+                  h("a", {href: "#", onClick: this.onSwitchToUser, "data-testid": "pm-switch-user"}, "Switch to User"),
+                  " to see effective permissions for a selected user on this object."
                 )
               )
               : null,
             model.mode === "user" && model.parents.length
-              ? h("p", {className: "slds-text-body_small slds-m-top_small"},
+              ? h("p", {className: "slds-text-body_small slds-m-top_small", "data-testid": "pm-assignments"},
                 "Assignments: " + model.parents.map(parent => parentKindLabel(parent.kind) + ": " + parent.label).join(" · ")
               )
               : null,
             h("div", {className: "slds-m-top_small"}, this.renderToolbar(model))
           )
         ),
-        this.renderOlsTable(model),
-        this.renderFlsTable(model)
+        this.renderSummary(model),
+        h("div", {className: "slds-card slds-m-around_medium"},
+          h("div", {className: "slds-card__body slds-card__body_inner"},
+            this.renderSections(model),
+            h("div", {className: "slds-m-top_small", "data-testid": "pm-section-body"}, this.renderBody(model))
+          )
+        )
       )
     );
   }

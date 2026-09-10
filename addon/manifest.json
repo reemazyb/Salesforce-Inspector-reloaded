@@ -178,7 +178,7 @@
       "description": "API Statistics"
     },
     "permission-matrix": {
-      "description": "Permission Matrix"
+      "description": "Permissions"
     }
   }
 }
