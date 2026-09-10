@@ -162,8 +162,8 @@ export async function routeMock(route, host) {
         updateable: true,
         deletable: true,
         fields: [
-          {name: "Id", label: "Account ID", type: "id", createable: false, updateable: false, nillable: false, referenceTo: []},
-          {name: "Name", label: "Account Name", type: "string", length: 255, createable: true, updateable: true, nillable: false, nameField: true, referenceTo: []},
+          {name: "Id", label: "Account ID", type: "id", createable: false, updateable: false, nillable: false, permissionable: false, calculated: false, referenceTo: []},
+          {name: "Name", label: "Account Name", type: "string", length: 255, createable: true, updateable: true, nillable: false, nameField: true, permissionable: true, calculated: false, referenceTo: []},
           {name: "Type",
             label: "Account Type",
             type: "picklist",
@@ -176,8 +176,10 @@ export async function routeMock(route, host) {
               {value: "Customer", label: "Customer", active: true},
               {value: "Partner", label: "Partner", active: true}
             ],
+            permissionable: true,
+            calculated: false,
             referenceTo: []},
-          {name: "Description", label: "Description", type: "textarea", createable: true, updateable: true, nillable: true, referenceTo: []}
+          {name: "Description", label: "Description", type: "textarea", createable: true, updateable: true, nillable: true, permissionable: true, calculated: false, referenceTo: []}
         ],
         childRelationships: [
           {relationshipName: "Contacts", childSObject: "Contact", field: "AccountId"}
@@ -187,6 +189,21 @@ export async function routeMock(route, host) {
           rowTemplate: `/services/data/v${apiVersion}/sobjects/Account/{ID}`,
           layouts: `/services/data/v${apiVersion}/sobjects/Account/describe/layouts`
         }
+      });
+      return true;
+    }
+
+    if (path.includes("/sobjects/PermissionSet/describe")) {
+      await success({
+        name: "PermissionSet",
+        fields: [
+          {name: "Id", label: "Permission Set ID", type: "id"},
+          {name: "Name", label: "API Name", type: "string"},
+          {name: "PermissionsViewAllData", label: "View All Data", type: "boolean"},
+          {name: "PermissionsModifyAllData", label: "Modify All Data", type: "boolean"},
+          {name: "PermissionsApiEnabled", label: "API Enabled", type: "boolean"},
+          {name: "PermissionsManageUsers", label: "Manage Users", type: "boolean"}
+        ]
       });
       return true;
     }
@@ -468,7 +485,130 @@ export async function routeMock(route, host) {
         return;
       }
 
-      if (query.includes(" from permissionset") || query.includes("from+permissionset")) {
+      if (query.includes("from permissionsetassignment") || query.includes("from+permissionsetassignment")) {
+        await fulfillSuccess(route, {
+          totalSize: 2,
+          done: true,
+          records: [
+            {
+              PermissionSetId: "0PS000000000002AAA",
+              PermissionSetGroupId: null,
+              PermissionSet: {
+                Id: "0PS000000000002AAA",
+                Name: "Admin",
+                Label: "System Administrator",
+                Type: "Profile",
+                IsOwnedByProfile: true,
+                ProfileId: "00e000000000001AAA",
+                Profile: {Name: "System Administrator"}
+              }
+            },
+            {
+              PermissionSetId: "0PS000000000001AAA",
+              PermissionSetGroupId: "0PG000000000001AAA",
+              PermissionSet: {
+                Id: "0PS000000000001AAA",
+                Name: "TestPermissionSet",
+                Label: "Test Permission Set",
+                Type: "Regular",
+                IsOwnedByProfile: false,
+                ProfileId: null,
+                Profile: null
+              },
+              PermissionSetGroup: {MasterLabel: "Test Group", DeveloperName: "Test_Group"}
+            }
+          ]
+        });
+        return true;
+      }
+
+      if (query.includes("from objectpermissions") || query.includes("from+objectpermissions")) {
+        await fulfillSuccess(route, {
+          totalSize: 2,
+          done: true,
+          records: [
+            {
+              ParentId: "0PS000000000002AAA",
+              SobjectType: "Account",
+              PermissionsRead: true,
+              PermissionsCreate: true,
+              PermissionsEdit: true,
+              PermissionsDelete: true,
+              PermissionsViewAllRecords: true,
+              PermissionsModifyAllRecords: true
+            },
+            {
+              ParentId: "0PS000000000001AAA",
+              SobjectType: "Account",
+              PermissionsRead: true,
+              PermissionsCreate: false,
+              PermissionsEdit: false,
+              PermissionsDelete: false,
+              PermissionsViewAllRecords: false,
+              PermissionsModifyAllRecords: false
+            },
+            {
+              ParentId: "0PS000000000003AAA",
+              SobjectType: "Account",
+              PermissionsRead: true,
+              PermissionsCreate: false,
+              PermissionsEdit: false,
+              PermissionsDelete: false,
+              PermissionsViewAllRecords: false,
+              PermissionsModifyAllRecords: false
+            }
+          ]
+        });
+        return true;
+      }
+
+      if (query.includes("from fieldpermissions") || query.includes("from+fieldpermissions")) {
+        await fulfillSuccess(route, {
+          totalSize: 2,
+          done: true,
+          records: [
+            {
+              ParentId: "0PS000000000002AAA",
+              SobjectType: "Account",
+              Field: "Account.Name",
+              PermissionsRead: true,
+              PermissionsEdit: true
+            },
+            {
+              ParentId: "0PS000000000001AAA",
+              SobjectType: "Account",
+              Field: "Account.Name",
+              PermissionsRead: true,
+              PermissionsEdit: false
+            }
+          ]
+        });
+        return true;
+      }
+
+      if (query.includes("from setupentityaccess") || query.includes("from+setupentityaccess")) {
+        await fulfillSuccess(route, {
+          totalSize: 1,
+          done: true,
+          records: [
+            {ParentId: "0PS000000000001AAA", SetupEntityId: "0CP000000000001AAA"}
+          ]
+        });
+        return true;
+      }
+
+      if (query.includes("from custompermission") || query.includes("from+custompermission")) {
+        await fulfillSuccess(route, {
+          totalSize: 1,
+          done: true,
+          records: [
+            {Id: "0CP000000000001AAA", DeveloperName: "Can_Approve", MasterLabel: "Can Approve", NamespacePrefix: null}
+          ]
+        });
+        return true;
+      }
+
+      if (query.includes("from permissionset") || query.includes("from+permissionset")) {
         await fulfillSuccess(route, {
           totalSize: 3,
           done: true,
@@ -476,21 +616,41 @@ export async function routeMock(route, host) {
             {
               Id: "0PS000000000001AAA",
               Name: "TestPermissionSet",
-              Profile: null
+              Label: "Test Permission Set",
+              Type: "Regular",
+              IsOwnedByProfile: false,
+              ProfileId: null,
+              Profile: null,
+              PermissionsViewAllData: false,
+              PermissionsModifyAllData: false,
+              PermissionsApiEnabled: true,
+              PermissionsManageUsers: false
             },
             {
               Id: "0PS000000000002AAA",
-              Name: "AdminPermissionSet",
-              Profile: {
-                Name: "System Administrator"
-              }
+              Name: "Admin",
+              Label: "System Administrator",
+              Type: "Profile",
+              IsOwnedByProfile: true,
+              ProfileId: "00e000000000001AAA",
+              Profile: {Name: "System Administrator"},
+              PermissionsViewAllData: true,
+              PermissionsModifyAllData: true,
+              PermissionsApiEnabled: true,
+              PermissionsManageUsers: true
             },
             {
               Id: "0PS000000000003AAA",
               Name: "StandardPermissionSet",
-              Profile: {
-                Name: "Standard User"
-              }
+              Label: "Standard User",
+              Type: "Profile",
+              IsOwnedByProfile: true,
+              ProfileId: "00e000000000002AAA",
+              Profile: {Name: "Standard User"},
+              PermissionsViewAllData: false,
+              PermissionsModifyAllData: false,
+              PermissionsApiEnabled: true,
+              PermissionsManageUsers: false
             }
           ]
         });

@@ -392,6 +392,7 @@ test.describe("Popup", () => {
       await expect(page.frameLocator(".insext-popup").locator("a:has-text('Data Import')")).toBeVisible();
       await expect(page.frameLocator(".insext-popup").locator("a:has-text('Field Creator')")).toBeVisible();
       await expect(page.frameLocator(".insext-popup").locator("a:has-text('Download Metadata')")).toBeVisible();
+      await expect(page.frameLocator(".insext-popup").locator("a:has-text('Permissions')")).toBeVisible();
 
       // Verify Platform Tools section
       await expect(page.frameLocator(".insext-popup").locator("text=Platform Tools")).toBeVisible();
